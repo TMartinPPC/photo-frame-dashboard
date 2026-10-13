@@ -16,18 +16,22 @@ on an MBR card with partitions at 1 MiB or later is unused space before the firs
 nothing outside the image area may change. The script refuses a card that already holds a
 different boot image (eGON header at 8 KiB), except the FEL stub.
 
-Usage (elevated PowerShell for prepare):
+Usage (Windows: elevated PowerShell for prepare; Linux: sudo):
   python -I scripts/a33-sdboot/fel-sdcard.py list
-  python -I scripts/a33-sdboot/fel-sdcard.py prepare <disk number> [image]
+  python -I scripts/a33-sdboot/fel-sdcard.py prepare <disk number> [image]        # Windows
+  python3 -I scripts/a33-sdboot/fel-sdcard.py prepare /dev/sdX <exact-bytes> [image]  # Linux
 """
 import ctypes
 import hashlib
 import json
 import os
+import platform
 import struct
 import subprocess
 import sys
 from pathlib import Path
+
+ON_LINUX = platform.system() == "Linux"
 
 ROOT = Path(__file__).resolve().parents[2]
 STUB = ROOT / "diagnostics" / "tools" / "sunxi" / "fel-sdboot.sunxi"
@@ -45,6 +49,15 @@ def die(msg):
 
 
 def disks():
+    if ON_LINUX:
+        out = subprocess.check_output(
+            ["lsblk", "-J", "-b", "-o", "NAME,TYPE,SIZE,RM,TRAN,MOUNTPOINTS,MODEL"], text=True)
+        tree = json.loads(out)
+        whole = [b for b in tree.get("blockdevices", []) if b.get("type") == "disk"]
+        return [{"Number": "/dev/" + b["name"], "FriendlyName": b.get("model") or b["name"],
+                 "BusType": b.get("tran") or "", "Size": b["size"], "RM": b.get("rm"),
+                 "PartitionStyle": None, "MOUNTPOINTS": b.get("mountpoints") or []}
+                for b in whole]
     ps = ("Get-Disk | Select-Object Number,FriendlyName,BusType,Size,"
           "PartitionStyle,IsBoot,IsSystem,IsOffline | ConvertTo-Json -Compress")
     out = subprocess.check_output(["powershell", "-NoProfile", "-Command", ps], text=True)
@@ -53,15 +66,34 @@ def disks():
 
 
 def show(d):
+    if ON_LINUX:
+        return (f"{d['Number']}: {d['FriendlyName']} ({d['BusType'] or 'no-usb'}), "
+                f"{d['Size'] / 1e9:.1f} GB, removable={d['RM']}")
     return (f"disk {d['Number']}: {d['FriendlyName']} ({d['BusType']}), "
             f"{d['Size'] / 1e9:.1f} GB, {d['PartitionStyle']}")
 
 
-def card(number):
-    match = [d for d in disks() if d["Number"] == number]
+def card(disk):
+    match = [d for d in disks() if d["Number"] == disk]
     if not match:
-        die(f"no disk {number}")
+        die(f"no disk {disk}")
     d = match[0]
+    if ON_LINUX:
+        if d["BusType"] != "usb" and d["RM"] != 1:
+            die(f"{disk} transport is {d['BusType'] or 'unknown'}, removable={d['RM']}; "
+                "refusing anything that is not a USB/removable card reader")
+        if d["MOUNTPOINTS"]:
+            die(f"{disk} has mounted filesystems {d['MOUNTPOINTS']}; unmount it first")
+        if not stat.S_ISBLK(os.stat(disk).st_mode):
+            die(f"{disk} is not a block device")
+        if not 0 < d["Size"] <= MAX_CARD:
+            die(f"{disk} is {d['Size'] / 1e9:.1f} GB; refusing anything over 256 GB")
+        with open(disk, "rb") as f:
+            mbr = f.read(512)
+        if mbr[510:512] != b"\x55\xaa" or any(mbr[446 + i * 16 + 4] == 0xEE for i in range(4)):
+            die(f"{disk} is not MBR (empty or GPT-protective); only MBR cards are supported")
+        return d
+    number = disk
     if d["IsBoot"] or d["IsSystem"]:
         die(f"disk {number} is a boot/system disk")
     if d["BusType"] not in ("SD", "USB", "MMC"):
@@ -73,8 +105,11 @@ def card(number):
     return d
 
 
-def read_prefix(number):
-    fd = os.open(rf"\\.\PhysicalDrive{number}", os.O_RDONLY | os.O_BINARY)
+def read_prefix(disk):
+    if ON_LINUX:
+        fd = os.open(disk, os.O_RDONLY)
+    else:
+        fd = os.open(rf"\\.\PhysicalDrive{disk}", os.O_RDONLY | os.O_BINARY)
     try:
         data = os.read(fd, PREFIX)
     finally:
@@ -122,8 +157,11 @@ def image_bytes(path):
     return data, f"{Path(path).name} (sha256 {hashlib.sha256(data).hexdigest()})"
 
 
-def write_region(number, offset, data):
-    fd = os.open(rf"\\.\PhysicalDrive{number}", os.O_RDWR | os.O_BINARY)
+def write_region(disk, offset, data):
+    if ON_LINUX:
+        fd = os.open(disk, os.O_RDWR)
+    else:
+        fd = os.open(rf"\\.\PhysicalDrive{disk}", os.O_RDWR | os.O_BINARY)
     try:
         os.lseek(fd, offset, os.SEEK_SET)
         n = os.write(fd, data)
@@ -134,20 +172,36 @@ def write_region(number, offset, data):
 
 
 def require_admin():
-    if not ctypes.windll.shell32.IsUserAnAdmin():
-        die("run from an elevated PowerShell (raw disk access)")
+    if ON_LINUX:
+        if os.geteuid() != 0:
+            die("run as root (raw disk access)")
+    else:
+        if not ctypes.windll.shell32.IsUserAnAdmin():
+            die("run from an elevated PowerShell (raw disk access)")
 
 
 def cmd_list():
     for d in disks():
-        flags = " [boot/system]" if d["IsBoot"] or d["IsSystem"] else ""
+        flags = ""
+        if ON_LINUX:
+            flags = " [mounted]" if d["MOUNTPOINTS"] else ""
+        elif d["IsBoot"] or d["IsSystem"]:
+            flags = " [boot/system]"
         print(show(d) + flags)
 
 
-def cmd_prepare(number, image=None):
+def cmd_prepare(disk, image=None, exact=None):
     require_admin()
+    if ON_LINUX:
+        try:
+            exact = int(exact) if exact is not None else None
+        except ValueError:
+            die("exact-bytes must be an integer (see `lsblk -b`)")
     data, what = image_bytes(image)
-    d = card(number)
+    d = card(disk)
+    if exact is not None and d["Size"] != exact:
+        die(f"the exact byte size on the command line ({exact}) does not match the card now "
+            f"({d['Size']}); recheck with `lsblk -b` and retry")
     before = read_prefix(number)
     starts = check_layout(before)
     if read_prefix(number) != before:
@@ -179,8 +233,10 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     if args[:1] == ["list"]:
         cmd_list()
-    elif args[:1] == ["prepare"] and len(args) in (2, 3):
+    elif args[:1] == ["prepare"] and len(args) in (2, 3) and not ON_LINUX:
         cmd_prepare(int(args[1]), args[2] if len(args) == 3 else None)
+    elif args[:1] == ["prepare"] and len(args) in (3, 4) and ON_LINUX:
+        cmd_prepare(args[1], args[3] if len(args) == 4 else None, args[2])
     else:
         print(__doc__)
         sys.exit(2)

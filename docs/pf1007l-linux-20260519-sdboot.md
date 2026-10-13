@@ -8,11 +8,9 @@ rooted on 2026-10-12. Two things are new here:
    ([`scripts/a33-sdboot/fel-sdcard-linux.py`](../../scripts/a33-sdboot/fel-sdcard-linux.py)).
 2. The Route U boot patch was written with the **payloads loaded from the SD
    card** (`fatload`) instead of FEL upload, because this unit corrupts large
-   FEL uploads. The guards, write ranges and verification are the ones from
-   [`scripts/a33-uboot/boot-patch.py`](../../scripts/a33-uboot/boot-patch.py);
-   only the payload transport differs. A ready-to-edit
-   [`scripts/a33-sdboot/sd-patch-write.cmd`](../../scripts/a33-sdboot/sd-patch-write.cmd)
-   documents the on-device sequence.
+   FEL uploads. `boot-patch.py --sd` generates the guarded script with every
+   sector, size and SHA-256 taken from the run against your own dump; only the
+   payload transport differs from the FEL scripts.
 
 Nothing in this report changes the repository's route preferences. Route S's
 hash guard still only accepts the January image, and this report does not edit
@@ -71,17 +69,22 @@ A repeated `sunxi-fel version` right before the payload run stayed correct, so
 the corruption is in the large bulk transfers, not the control path. This is
 why the write below moves payloads over the SD card instead.
 
-## Linux port of the card-writing step
+## The card step on Linux
 
-`fel-sdcard.py` is Windows-only. `scripts/a33-sdboot/fel-sdcard-linux.py` is a
-Linux port with the same guards: MBR only, no GPT, no partition before 1 MiB,
-refuses a boot image it did not write (recognized by the first 8 KiB of known
-builds), pads the tail with the card's own bytes, double-reads before, compares
-after. It writes only the boot area at byte 8192 — nothing else.
+`fel-sdcard.py` now runs on Linux (previously Windows-only):
 
-On this unit's first card (an ex-Batocera card repartitioned to a single
-partition at 4 MiB), the guide's own Python card procedure also worked; the
-port exists so the whole route runs on Linux.
+```sh
+sudo python3 -I scripts/a33-sdboot/fel-sdcard.py list
+sudo python3 -I scripts/a33-sdboot/fel-sdcard.py prepare /dev/sdX <exact-bytes> [image]
+```
+
+It keeps every Windows guard and adds the Linux-specific ones the platform
+needs: the card must be on a USB/removable reader (`lsblk` `tran=usb` or
+`rm=1` — SATA/NVMe disks are listed but refused), must be fully unmounted, must
+match the exact byte size given on the command line, and the typed
+confirmation is `WRITE /dev/sdX`. The write itself is unchanged: MBR only, no
+partition before 1 MiB, boot-area write at byte 8192 only, double-read before,
+readback compare after.
 
 ## SD-boot dump at 12 MHz (Linux)
 
@@ -112,6 +115,8 @@ Two build notes for reproducing:
   (as `build.sh` already does), is equivalent.
 - `CONFIG_CRC32_VERIFY=y` is required for `crc32 -v` and is **not** in
   `a33.config`. The Route U defconfig sets it, the SD-boot config does not.
+  The `--sd` scripts therefore use `hash sha256` (CONFIG_CMD_HASH and
+  CONFIG_SHA256 are in `a33.config`), which also verifies its digest.
 
 ## Writing the patch from the SD card
 
@@ -124,18 +129,24 @@ ramdisk slot 4853760 bytes at +10143744
 Write ranges: ramdisk [191844, 201324), header [172032, 172034)
 ```
 
-`sd-patch-write.cmd` (new file, in `scripts/a33-sdboot/`) carries the same
-payloads from the card's FAT partition and runs the same guard chain as the
-Route U write script:
+`boot-patch.py --sd` (new) generates `sd-write-boot.cmd/.scr` and
+`sd-restore-boot.cmd/.scr` from the run against your own dump. The guard chain,
+on-device:
 
-1. `fatload` all four payloads; refuse on any short load (size checked)
-2. `crc32 -v` on each payload (values from `plan.json`)
+1. `fatload` all four payloads from the card's FAT partition; refuse any short
+   load (`${filesize}` checked)
+2. `hash sha256` on each payload against the digest from this `boot-patch.py`
+   run (the SD-boot build has no `crc32 -v`)
 3. `cmp.b` of both p6 regions against the original bytes — refuse if p6 is not
    the verified original
 4. `mmc write` the ramdisk, `mmc read` it back, `cmp.b` — only then write the
    2-sector header
 5. re-read the whole p6, `hash sha256`, and record the hash in
    `a33-status.txt` on the card
+
+Every sector, size and digest in the generated script comes from the
+`boot-patch.py` run; there is nothing to hand-edit and nothing to reuse across
+units.
 
 Result on this unit: `w_result=OK_WRITTEN` and
 `p6_hash_after=fb23e82ee0345eb15bbdac87ecb722860d4561f7c8a9975e6d3399f5f2948988`,
